@@ -142,23 +142,20 @@ try:
 
     confirmed = hist[hist["confirmed"] == True]
 
-    # shaded episode bands, loaded from the clustered/filtered file
+    # one dot per real episode (clustered + magnitude-filtered), at the
+    # episode's start date -- that's the actionable moment, not the peak
     try:
         episodes = pd.read_csv(
             "historical_spread_episodes.csv",
             parse_dates=["start", "peak_date", "calm_date"],
         )
-        for _, ep in episodes.iterrows():
-            fig.add_vrect(
-                x0=ep["start"], x1=ep["calm_date"],
-                fillcolor="red", opacity=0.12, line_width=0,
-            )
+        episode_start_bps = hist.reindex(episodes["start"])["hy_oas_bps"].values
         fig.add_trace(go.Scatter(
-            x=episodes["peak_date"], y=episodes["peak_bps"],
-            mode="markers", name="Episode peak",
-            marker=dict(color="red", size=8, symbol="diamond"),
+            x=episodes["start"], y=episode_start_bps,
+            mode="markers", name="Episode start",
+            marker=dict(color="green", size=9, symbol="circle"),
             yaxis="y1",
-            hovertemplate="Peak: %{y:.0f}bps on %{x}<extra></extra>",
+            hovertemplate="Episode started %{x}<extra></extra>",
         ))
         n_episodes = len(episodes)
     except FileNotFoundError:
@@ -185,9 +182,9 @@ try:
 
     st.plotly_chart(fig, width='stretch')
     st.caption(
-        f"🔴 shaded bands = {n_episodes} real stress episodes (consecutive confirmed days "
-        f"clustered, filtered to those exceeding their own trailing-year median by 75bps+). "
-        f"Band width = start of widening through calm-down. Red diamond = peak of each episode."
+        f"🟢 {n_episodes} real episodes (consecutive confirmed days clustered, "
+        f"filtered to those exceeding their own trailing-year median by 75bps+). "
+        f"Dot marks when each episode started."
     )
 
     if not episodes.empty:
@@ -212,6 +209,72 @@ except Exception as e:
         "Likely a malformed or incomplete historical_spread_data.csv. "
         "Try rerunning `python build_history.py` locally and re-pushing."
     )
+
+# --- statistics: does this actually hold up? ---
+st.subheader("Does this actually hold up statistically?")
+
+try:
+    daily_corr_df = pd.read_csv("daily_correlation.csv")
+    dc = daily_corr_df.iloc[0]
+    dc_col1, dc_col2, dc_col3 = st.columns(3)
+    dc_col1.metric("Daily correlation (r)", f"{dc['correlation']:.3f}")
+    dc_col2.metric("p-value", f"{dc['p_value']:.2e}")
+    dc_col3.metric("Sample size", f"{int(dc['n']):,} days")
+    st.caption("Negative r = when spreads widen day-to-day, the S&P tends to fall that same day, and vice versa.")
+except FileNotFoundError:
+    pass
+
+try:
+    lead_lag_df = pd.read_csv("lead_lag_analysis.csv")
+    event_df = pd.read_csv("event_study.csv")
+
+    col_x, col_y = st.columns(2)
+
+    with col_x:
+        st.markdown("**Lead-lag correlation**")
+        st.caption("HY OAS 5-day change vs S&P forward return at each lag. More negative = stronger inverse relationship.")
+        st.line_chart(lead_lag_df.set_index("lag_days")["correlation"])
+        best_row = lead_lag_df.loc[lead_lag_df["correlation"].idxmin()]
+        st.metric(
+            f"Strongest signal at lag {int(best_row['lag_days'])}d",
+            f"r = {best_row['correlation']}",
+            f"p = {best_row['p_value']:.2e}",
+        )
+
+    with col_y:
+        st.markdown("**Event study: returns after a confirmed episode starts**")
+        st.caption("Comparing average S&P return after episodes vs the market's normal average return over the same length window.")
+        display_event = event_df.copy()
+        display_event["significant_at_5pct"] = display_event["significant_at_5pct"].map(
+            {True: "✅ yes", False: "❌ no", "True": "✅ yes", "False": "❌ no"}
+        )
+        st.dataframe(
+            display_event.rename(columns={
+                "horizon_days": "Days after",
+                "mean_return_after_episode": "Return after episode (%)",
+                "baseline_mean_return_pct": "Normal avg return (%)",
+                "difference_pct": "Difference (pp)",
+                "p_value": "p-value",
+                "significant_at_5pct": "Significant?",
+            })[["Days after", "Return after episode (%)", "Normal avg return (%)",
+                "Difference (pp)", "p-value", "Significant?"]],
+            width='stretch',
+            hide_index=True,
+        )
+
+    st.caption(
+        "Read this as: **p < 0.05** means the pattern is unlikely to be random chance. "
+        "A negative 'Difference' means returns were worse than normal following a confirmed "
+        "widening episode — which is the actual evidence for the thesis, not just the chart above."
+    )
+
+except FileNotFoundError:
+    st.info(
+        "No statistics file yet. Rerun `python build_history.py` (now computes these "
+        "automatically), then commit `lead_lag_analysis.csv` and `event_study.csv`."
+    )
+except Exception as e:
+    st.error(f"Couldn't load statistics: {e}")
 
 # --- live log history ---
 st.subheader("Live log (today onward)")

@@ -31,6 +31,7 @@ import numpy as np
 import yfinance as yf
 import io
 import requests
+from scipy import stats as scipy_stats
 
 from credit_spread_monitor import ROC_ALERT_BPS, CONFIRMATION_REQUIRED
 
@@ -178,6 +179,92 @@ def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(episodes)
 
 
+# --------------------------------------------------------------------------
+# Statistics: does spread widening actually precede price drops?
+# --------------------------------------------------------------------------
+
+def daily_correlation(hy_bps: pd.Series, sp500: pd.Series) -> dict:
+    """
+    Pearson correlation between day-to-day HY OAS changes (bps) and
+    day-to-day S&P 500 returns (%). A real inverse relationship shows up
+    as a negative, statistically significant r.
+    """
+    df = pd.DataFrame({"hy_chg": hy_bps.diff(), "sp_ret": sp500.pct_change()}).dropna()
+    r, p = scipy_stats.pearsonr(df["hy_chg"], df["sp_ret"])
+    return {"n": len(df), "correlation": round(r, 4), "p_value": p}
+
+
+def lead_lag_analysis(hy_bps: pd.Series, sp500: pd.Series, max_lag: int = 30) -> pd.DataFrame:
+    """
+    For each lag k = 1..max_lag trading days, correlates today's HY OAS
+    5-day rate of change against the S&P 500's forward return over the
+    NEXT k days. If spreads genuinely lead price, the correlation should
+    be negative and get stronger (more negative) at some specific lag,
+    not just at lag=0 -- that's what actually demonstrates "spread moves
+    first" rather than "they move together."
+    """
+    hy_5d_roc = hy_bps.diff(5)
+    results = []
+    for lag in range(1, max_lag + 1):
+        fwd_ret = sp500.pct_change(lag).shift(-lag)
+        df = pd.DataFrame({"hy_roc": hy_5d_roc, "fwd_ret": fwd_ret}).dropna()
+        if len(df) < 30:
+            continue
+        r, p = scipy_stats.pearsonr(df["hy_roc"], df["fwd_ret"])
+        results.append({"lag_days": lag, "correlation": round(r, 4), "p_value": p, "n": len(df)})
+    return pd.DataFrame(results)
+
+
+def event_study(episodes: pd.DataFrame, sp500: pd.Series, horizons=(5, 10, 20, 60)) -> pd.DataFrame:
+    """
+    For each real episode, measures the S&P 500's actual forward return
+    from the episode's START date over each horizon, then compares that
+    sample's mean against ALL possible equivalent-length windows in the
+    full history (the unconditional baseline) via a one-sample t-test.
+
+    A significant negative result means: returns following a confirmed
+    widening episode are worse than a random window would typically be --
+    that's the actual statistical proof, not just an eyeballed chart.
+    """
+    rows = []
+    for h in horizons:
+        # unconditional baseline: every possible h-day forward return in the full series
+        baseline = sp500.pct_change(h).shift(-h).dropna()
+
+        # conditional: forward return starting from each episode's start date
+        episode_returns = []
+        for start_date in episodes["start"]:
+            if start_date not in sp500.index:
+                future_idx = sp500.index[sp500.index >= start_date]
+                if len(future_idx) == 0:
+                    continue
+                start_date = future_idx[0]
+            loc = sp500.index.get_loc(start_date)
+            if loc + h >= len(sp500):
+                continue
+            ret = sp500.iloc[loc + h] / sp500.iloc[loc] - 1
+            episode_returns.append(ret)
+
+        if len(episode_returns) < 2:
+            continue
+
+        episode_returns = np.array(episode_returns)
+        t_stat, p_val = scipy_stats.ttest_1samp(episode_returns, baseline.mean())
+
+        rows.append({
+            "horizon_days": h,
+            "n_episodes": len(episode_returns),
+            "mean_return_after_episode": round(episode_returns.mean() * 100, 2),
+            "baseline_mean_return_pct": round(baseline.mean() * 100, 2),
+            "difference_pct": round((episode_returns.mean() - baseline.mean()) * 100, 2),
+            "t_stat": round(t_stat, 3),
+            "p_value": round(p_val, 4),
+            "significant_at_5pct": bool(p_val < 0.05),
+        })
+
+    return pd.DataFrame(rows)
+
+
 def main():
     print("Fetching GitHub mirror (1996-2021)...")
     mirror = fetch_github_mirror()
@@ -227,6 +314,37 @@ def main():
         duration = (row["calm_date"] - row["start"]).days
         print(f"  {row['start'].date()} -> {row['calm_date'].date()} "
               f"({duration}d)  peak={row['peak_bps']:.0f}bps on {row['peak_date'].date()}")
+
+    # -------------------- statistics --------------------
+    print("\n" + "=" * 60)
+    print("STATISTICS")
+    print("=" * 60)
+
+    corr = daily_correlation(hy_combined, sp500)
+    pd.DataFrame([corr]).to_csv("daily_correlation.csv", index=False)
+    print(f"\nDaily correlation (HY OAS change vs S&P return): "
+          f"r={corr['correlation']}, p={corr['p_value']:.2e}, n={corr['n']}")
+    sig = "significant" if corr["p_value"] < 0.05 else "NOT significant"
+    print(f"  -> {sig} at 5% level. Negative r = spreads up, price down (as expected).")
+
+    lead_lag_df = lead_lag_analysis(hy_combined, sp500)
+    lead_lag_df.to_csv("lead_lag_analysis.csv", index=False)
+    if not lead_lag_df.empty:
+        best = lead_lag_df.loc[lead_lag_df["correlation"].idxmin()]
+        print(f"\nLead-lag analysis (saved to lead_lag_analysis.csv):")
+        print(f"  Strongest negative correlation at lag={int(best['lag_days'])} days: "
+              f"r={best['correlation']}, p={best['p_value']:.2e}")
+        print(f"  -> Spread widening tends to precede price weakness by ~{int(best['lag_days'])} trading days")
+
+    event_df = event_study(clusters_df, sp500)
+    event_df.to_csv("event_study.csv", index=False)
+    print(f"\nEvent study (saved to event_study.csv):")
+    for _, row in event_df.iterrows():
+        sig_flag = "***" if row["significant_at_5pct"] else "(not significant)"
+        print(f"  {int(row['horizon_days'])}d after episode start: "
+              f"mean return {row['mean_return_after_episode']}% vs baseline "
+              f"{row['baseline_mean_return_pct']}% (diff {row['difference_pct']}pp, "
+              f"p={row['p_value']}) {sig_flag}")
 
     # flag the data gap explicitly so it's visible in the console too
     gap_start = mirror.index.max()
