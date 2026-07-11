@@ -109,8 +109,71 @@ else:
 with st.expander("How this works"):
     st.markdown(PLAIN_ENGLISH_EXPLANATION)
 
-# --- history chart ---
-st.subheader("History")
+# --- historical chart: confirmed alerts vs S&P 500 ---
+st.subheader("History: 2018–present")
+st.caption(
+    "Static file, built once with build_history.py and committed to git — "
+    "persists across redeploys, unlike the live log above."
+)
+
+try:
+    hist = pd.read_csv("historical_spread_data.csv", parse_dates=["date"], index_col="date")
+
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=hist["hy_oas_bps"],
+        name="HY OAS (bps)", yaxis="y1",
+        line=dict(color="orange", width=1.5),
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=hist["sp500_close"],
+        name="S&P 500", yaxis="y2",
+        line=dict(color="steelblue", width=1.5),
+    ))
+
+    confirmed = hist[hist["confirmed"] == True]
+    fig.add_trace(go.Scatter(
+        x=confirmed.index, y=confirmed["hy_oas_bps"],
+        mode="markers", name="Confirmed alert",
+        marker=dict(color="green", size=9, symbol="circle"),
+        yaxis="y1",
+        text=confirmed["detail"],
+        hovertemplate="%{x}<br>HY OAS: %{y:.0f}bps<br>%{text}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        yaxis=dict(title="HY OAS (bps)", side="left"),
+        yaxis2=dict(title="S&P 500", overlaying="y", side="right"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(t=40, b=20),
+        height=500,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "🟢 green dots = confirmed widening signal (2+ of 3 ROC windows fired together). "
+        "Compare against the S&P 500 line to see how far ahead of a drawdown the signal fired."
+    )
+
+    with st.expander("All confirmed alert dates"):
+        st.dataframe(
+            confirmed[["hy_oas_bps", "sp500_close", "detail"]].sort_index(ascending=False),
+            use_container_width=True,
+        )
+
+except FileNotFoundError:
+    st.info(
+        "No historical file yet. Run `python build_history.py` locally, then "
+        "`git add historical_spread_data.csv && git commit -m \"add history\" && git push` "
+        "to make it appear here."
+    )
+
+# --- live log history ---
+st.subheader("Live log (today onward)")
 log_df = load_log_history()
 if not log_df.empty:
     chart_df = log_df.set_index("timestamp")[["hy_oas_bps", "ig_oas_bps"]]
