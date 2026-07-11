@@ -118,6 +118,10 @@ st.caption(
 
 try:
     hist = pd.read_csv("historical_spread_data.csv", parse_dates=["date"], index_col="date")
+    # CSV round-trip turns booleans into the strings "True"/"False" -- convert
+    # back, otherwise `== True` silently matches nothing and no green dots show.
+    if hist["confirmed"].dtype == object:
+        hist["confirmed"] = hist["confirmed"].map({"True": True, "False": False})
 
     import plotly.graph_objects as go
 
@@ -137,14 +141,39 @@ try:
     ))
 
     confirmed = hist[hist["confirmed"] == True]
-    fig.add_trace(go.Scatter(
-        x=confirmed.index, y=confirmed["hy_oas_bps"],
-        mode="markers", name="Confirmed alert",
-        marker=dict(color="green", size=9, symbol="circle"),
-        yaxis="y1",
-        text=confirmed["detail"],
-        hovertemplate="%{x}<br>HY OAS: %{y:.0f}bps<br>%{text}<extra></extra>",
-    ))
+
+    # shaded episode bands, loaded from the clustered/filtered file
+    try:
+        episodes = pd.read_csv(
+            "historical_spread_episodes.csv",
+            parse_dates=["start", "peak_date", "calm_date"],
+        )
+        for _, ep in episodes.iterrows():
+            fig.add_vrect(
+                x0=ep["start"], x1=ep["calm_date"],
+                fillcolor="red", opacity=0.12, line_width=0,
+            )
+        fig.add_trace(go.Scatter(
+            x=episodes["peak_date"], y=episodes["peak_bps"],
+            mode="markers", name="Episode peak",
+            marker=dict(color="red", size=8, symbol="diamond"),
+            yaxis="y1",
+            hovertemplate="Peak: %{y:.0f}bps on %{x}<extra></extra>",
+        ))
+        n_episodes = len(episodes)
+    except FileNotFoundError:
+        episodes = pd.DataFrame()
+        n_episodes = 0
+        st.warning(
+            "historical_spread_episodes.csv not found — showing raw daily dots only. "
+            "Rerun build_history.py to generate the clustered episode view."
+        )
+        fig.add_trace(go.Scatter(
+            x=confirmed.index, y=confirmed["hy_oas_bps"],
+            mode="markers", name="Confirmed alert (unclustered)",
+            marker=dict(color="green", size=7),
+            yaxis="y1",
+        ))
 
     fig.update_layout(
         yaxis=dict(title="HY OAS (bps)", side="left"),
@@ -154,23 +183,34 @@ try:
         height=500,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     st.caption(
-        "🟢 green dots = confirmed widening signal (2+ of 3 ROC windows fired together). "
-        "Compare against the S&P 500 line to see how far ahead of a drawdown the signal fired."
+        f"🔴 shaded bands = {n_episodes} real stress episodes (consecutive confirmed days "
+        f"clustered, filtered to those exceeding their own trailing-year median by 75bps+). "
+        f"Band width = start of widening through calm-down. Red diamond = peak of each episode."
     )
 
-    with st.expander("All confirmed alert dates"):
-        st.dataframe(
-            confirmed[["hy_oas_bps", "sp500_close", "detail"]].sort_index(ascending=False),
-            use_container_width=True,
-        )
+    if not episodes.empty:
+        with st.expander("All episodes"):
+            display_ep = episodes.copy()
+            display_ep["duration_days"] = (display_ep["calm_date"] - display_ep["start"]).dt.days
+            st.dataframe(
+                display_ep[["start", "peak_date", "peak_bps", "calm_date", "duration_days"]]
+                    .sort_values("start", ascending=False),
+                width='stretch',
+            )
 
 except FileNotFoundError:
     st.info(
         "No historical file yet. Run `python build_history.py` locally, then "
         "`git add historical_spread_data.csv && git commit -m \"add history\" && git push` "
         "to make it appear here."
+    )
+except Exception as e:
+    st.error(f"Couldn't load the history chart: {e}")
+    st.caption(
+        "Likely a malformed or incomplete historical_spread_data.csv. "
+        "Try rerunning `python build_history.py` locally and re-pushing."
     )
 
 # --- live log history ---
@@ -180,6 +220,6 @@ if not log_df.empty:
     chart_df = log_df.set_index("timestamp")[["hy_oas_bps", "ig_oas_bps"]]
     st.line_chart(chart_df)
     with st.expander("Raw log"):
-        st.dataframe(log_df.sort_values("timestamp", ascending=False), use_container_width=True)
+        st.dataframe(log_df.sort_values("timestamp", ascending=False), width='stretch')
 else:
     st.info("No history yet — check back after this has run a few times.")

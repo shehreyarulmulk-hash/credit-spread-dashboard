@@ -104,6 +104,80 @@ def compute_confirmed_alerts(hy_bps: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(records).set_index("date")
 
 
+# Cluster tuning -- see discussion: groups consecutive confirmed days into
+# one "episode" instead of flagging every individual day, then filters out
+# episodes too small to matter, then extends each episode's shaded window
+# from first trigger through to when spreads actually calm back down
+# (not just to the peak) -- gives a duration reading, not just a trigger point.
+MAX_GAP_DAYS = 3          # bridge gaps of up to N trading days within a cluster
+TRAILING_WINDOW_DAYS = 252  # ~1 trading year, for the relative magnitude floor
+MAGNITUDE_FLOOR_BPS = 75   # cluster peak must exceed trailing median by this much
+CALM_DOWN_MARGIN_BPS = 75  # "calmed down" = back under trailing median + this
+
+
+def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series) -> pd.DataFrame:
+    """
+    Groups confirmed days into episodes, filters by a relative magnitude
+    floor, and finds each episode's calm-down date.
+
+    Returns one row per real episode: start, peak_date, peak_bps,
+    calm_date (end of shaded span), and the trailing median used for
+    the floor (for transparency/debugging).
+    """
+    hy_bps = hy_bps.sort_index()
+    trailing_median = hy_bps.rolling(TRAILING_WINDOW_DAYS, min_periods=30).median()
+
+    confirmed_dates = alerts_df.index[alerts_df["confirmed"]].sort_values()
+    if len(confirmed_dates) == 0:
+        return pd.DataFrame(columns=["start", "peak_date", "peak_bps", "calm_date", "trailing_median_at_start"])
+
+    # group into raw clusters, bridging gaps <= MAX_GAP_DAYS trading days
+    date_list = list(hy_bps.index)
+    idx_of = {d: i for i, d in enumerate(date_list)}
+
+    clusters = []
+    current = [confirmed_dates[0]]
+    for d in confirmed_dates[1:]:
+        gap = idx_of[d] - idx_of[current[-1]]
+        if gap <= MAX_GAP_DAYS:
+            current.append(d)
+        else:
+            clusters.append(current)
+            current = [d]
+    clusters.append(current)
+
+    episodes = []
+    for cluster in clusters:
+        start = cluster[0]
+        window = hy_bps.loc[start:cluster[-1]]
+        peak_date = window.idxmax()
+        peak_bps = window.max()
+
+        floor_ref = trailing_median.loc[start] if not pd.isna(trailing_median.loc[start]) else hy_bps.loc[:start].median()
+
+        # magnitude floor: skip small episodes that triggered the ROC logic
+        # but never actually got meaningfully elevated vs their own regime
+        if peak_bps < floor_ref + MAGNITUDE_FLOOR_BPS:
+            continue
+
+        # extend to calm-down: walk forward from peak until spread falls
+        # back under trailing_median + CALM_DOWN_MARGIN_BPS, or data ends
+        calm_target = floor_ref + CALM_DOWN_MARGIN_BPS
+        post_peak = hy_bps.loc[peak_date:]
+        calmed = post_peak[post_peak <= calm_target]
+        calm_date = calmed.index[0] if len(calmed) > 0 else hy_bps.index[-1]
+
+        episodes.append({
+            "start": start,
+            "peak_date": peak_date,
+            "peak_bps": round(peak_bps, 1),
+            "calm_date": calm_date,
+            "trailing_median_at_start": round(floor_ref, 1),
+        })
+
+    return pd.DataFrame(episodes)
+
+
 def main():
     print("Fetching GitHub mirror (1996-2021)...")
     mirror = fetch_github_mirror()
@@ -135,17 +209,24 @@ def main():
     print("Computing confirmed-alert dates across full history...")
     alerts_df = compute_confirmed_alerts(hy_combined)
 
+    print("Grouping into episodes (clustering, magnitude floor, calm-down extension)...")
+    clusters_df = build_clusters(alerts_df, hy_combined)
+    clusters_df.to_csv("historical_spread_episodes.csv", index=False)
+
     print("Merging with S&P 500...")
     merged = alerts_df.join(sp500.rename("sp500_close"), how="outer")
     merged = merged.sort_index()
 
     merged.to_csv(OUTPUT_PATH)
     print(f"\nSaved {len(merged)} rows to {OUTPUT_PATH}")
+    print(f"Saved {len(clusters_df)} episodes to historical_spread_episodes.csv")
 
-    confirmed_dates = merged[merged["confirmed"] == True]
-    print(f"\n{len(confirmed_dates)} confirmed alert days found across the full history:")
-    for date, row in confirmed_dates.iterrows():
-        print(f"  {date.date()}  HY OAS={row['hy_oas_bps']:.0f}bps  ({row['detail']})")
+    print(f"\n{len(clusters_df)} real episodes found (raw confirmed days collapsed via "
+          f"clustering + {MAGNITUDE_FLOOR_BPS}bps magnitude floor):")
+    for _, row in clusters_df.iterrows():
+        duration = (row["calm_date"] - row["start"]).days
+        print(f"  {row['start'].date()} -> {row['calm_date'].date()} "
+              f"({duration}d)  peak={row['peak_bps']:.0f}bps on {row['peak_date'].date()}")
 
     # flag the data gap explicitly so it's visible in the console too
     gap_start = mirror.index.max()
