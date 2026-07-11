@@ -1,0 +1,121 @@
+"""
+app_credit_spread.py
+
+Streamlit page for the credit spread monitor. Self-updates on a schedule
+(via cached fetches with a TTL) rather than requiring a manual re-run.
+
+Run standalone:
+    streamlit run app_credit_spread.py
+
+Or merge into your existing app.py: copy the "PAGE BODY" section below
+into wherever you want this panel to appear, and keep credit_spread_monitor.py
+alongside it.
+"""
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+
+from credit_spread_monitor import (
+    run_credit_check,
+    PLAIN_ENGLISH_EXPLANATION,
+    LOG_PATH,
+)
+
+# --------------------------------------------------------------------------
+# Auto-refresh (optional dependency)
+# --------------------------------------------------------------------------
+# streamlit has no built-in "run this every N minutes" -- the standard way
+# is the streamlit-autorefresh package, which just triggers a page rerun.
+# Falls back gracefully if it isn't installed: pip install streamlit-autorefresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
+
+
+# --------------------------------------------------------------------------
+# Cached data fetch -- this is what makes it "self-updating"
+# --------------------------------------------------------------------------
+# FRED's HY/IG OAS series update once per business day (T+1 morning), so an
+# hourly cache is already more than fresh enough -- no point hammering the
+# endpoint every rerun. Streamlit reruns the whole script on every
+# interaction, so without this cache you'd refetch on every click.
+
+@st.cache_data(ttl=3600, show_spinner="Fetching latest credit spread data...")
+def get_credit_check():
+    return run_credit_check(log=True)
+
+
+def load_log_history():
+    try:
+        return pd.read_csv(LOG_PATH, parse_dates=["timestamp"])
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+
+# ==========================================================================
+# PAGE BODY -- copy this section into app.py if merging rather than running
+# standalone
+# ==========================================================================
+
+st.set_page_config(page_title="Credit Spread Monitor", layout="wide")
+st.title("📉 Credit Spread Monitor")
+
+# --- refresh controls ---
+col_a, col_b, col_c = st.columns([2, 1, 1])
+with col_a:
+    if HAS_AUTOREFRESH:
+        refresh_minutes = st.slider("Auto-refresh every (minutes)", 5, 60, 15)
+        st_autorefresh(interval=refresh_minutes * 60 * 1000, key="credit_spread_autorefresh")
+    else:
+        st.caption("Install `streamlit-autorefresh` for automatic page refresh. "
+                   "Data itself still updates hourly via cache regardless.")
+with col_c:
+    if st.button("🔄 Refresh now"):
+        get_credit_check.clear()
+        st.rerun()
+
+result = get_credit_check()
+st.caption(f"Last data fetch: {result['timestamp']} (cached up to 1 hour)")
+
+# --- headline metrics ---
+m1, m2, m3 = st.columns(3)
+m1.metric("HY OAS", f"{result['hy_oas_bps']:.0f} bps")
+m2.metric("IG OAS", f"{result['ig_oas_bps']:.0f} bps")
+
+status = result["status"]
+status_display = {
+    "WIDENING": "🔴 WIDENING",
+    "WATCH": "🟡 WATCH",
+    "STABLE": "🟢 STABLE",
+}
+m3.metric("Status", status_display.get(status, status))
+
+# --- alerts ---
+if result["alerts"]:
+    st.error("**Confirmed alerts:**")
+    for a in result["alerts"]:
+        st.write(f"- {a}")
+elif result.get("unconfirmed_notes"):
+    st.warning("**Watch (unconfirmed — one signal only, likely noise):**")
+    for n in result["unconfirmed_notes"]:
+        st.write(f"- {n}")
+else:
+    st.success("No alerts. Spreads stable relative to recent regime.")
+
+# --- explanation ---
+with st.expander("How this works"):
+    st.markdown(PLAIN_ENGLISH_EXPLANATION)
+
+# --- history chart ---
+st.subheader("History")
+log_df = load_log_history()
+if not log_df.empty:
+    chart_df = log_df.set_index("timestamp")[["hy_oas_bps", "ig_oas_bps"]]
+    st.line_chart(chart_df)
+    with st.expander("Raw log"):
+        st.dataframe(log_df.sort_values("timestamp", ascending=False), use_container_width=True)
+else:
+    st.info("No history yet — check back after this has run a few times.")
