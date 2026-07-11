@@ -276,6 +276,51 @@ except FileNotFoundError:
 except Exception as e:
     st.error(f"Couldn't load statistics: {e}")
 
+# --- early vs confirmed trigger: does firing sooner help? ---
+st.subheader("Earlier trigger (1-of-3) vs confirmed (2-of-3): worth the extra noise?")
+
+try:
+    event_early = pd.read_csv("event_study_early.csv")
+    lead_time = pd.read_csv("early_trigger_lead_time.csv")
+    early_eps_count = len(pd.read_csv("historical_spread_episodes_early.csv"))
+    confirmed_eps_count = len(episodes) if not episodes.empty else 0
+
+    lt1, lt2, lt3 = st.columns(3)
+    lt1.metric("Confirmed episodes (2-of-3)", confirmed_eps_count)
+    lt2.metric("Early-trigger episodes (1-of-3)", early_eps_count,
+               f"+{early_eps_count - confirmed_eps_count} more (potential false positives)")
+    if not lead_time.empty:
+        lt3.metric("Avg lead time gained", f"{lead_time['calendar_days_earlier'].mean():.1f} days")
+
+    st.markdown("**Event study using the earlier trigger:**")
+    display_early = event_early.copy()
+    display_early["significant_at_5pct"] = display_early["significant_at_5pct"].map(
+        {True: "✅ yes", False: "❌ no", "True": "✅ yes", "False": "❌ no"}
+    )
+    st.dataframe(
+        display_early.rename(columns={
+            "horizon_days": "Days after",
+            "mean_return_after_episode": "Return after episode (%)",
+            "baseline_mean_return_pct": "Normal avg return (%)",
+            "difference_pct": "Difference (pp)",
+            "p_value": "p-value",
+            "significant_at_5pct": "Significant?",
+        })[["Days after", "Return after episode (%)", "Normal avg return (%)",
+            "Difference (pp)", "p-value", "Significant?"]],
+        width='stretch',
+        hide_index=True,
+    )
+    st.caption(
+        "Compare this table against the confirmed-trigger table above. If the early trigger's "
+        "p-values are similar or better despite firing sooner, the extra lead time is worth the "
+        "noise. If they're worse, the confirmation requirement is doing real work filtering false alarms."
+    )
+
+except FileNotFoundError:
+    st.info("Run the updated `build_history.py` to generate this comparison.")
+except Exception as e:
+    st.error(f"Couldn't load trigger comparison: {e}")
+
 # --- live log history ---
 st.subheader("Live log (today onward)")
 log_df = load_log_history()

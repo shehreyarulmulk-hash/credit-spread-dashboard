@@ -116,10 +116,16 @@ MAGNITUDE_FLOOR_BPS = 75   # cluster peak must exceed trailing median by this mu
 CALM_DOWN_MARGIN_BPS = 75  # "calmed down" = back under trailing median + this
 
 
-def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series) -> pd.DataFrame:
+def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series, min_breach: int = CONFIRMATION_REQUIRED) -> pd.DataFrame:
     """
-    Groups confirmed days into episodes, filters by a relative magnitude
-    floor, and finds each episode's calm-down date.
+    Groups days where >= min_breach of the 3 ROC windows fired into
+    episodes, filters by a relative magnitude floor, and finds each
+    episode's calm-down date.
+
+    min_breach=2 (default) is the "confirmed" trigger used elsewhere.
+    min_breach=1 is a looser, earlier trigger -- fires sooner but with
+    more false positives -- used to test whether an earlier trigger
+    captures more lead time on the actual drawdown.
 
     Returns one row per real episode: start, peak_date, peak_bps,
     calm_date (end of shaded span), and the trailing median used for
@@ -128,8 +134,8 @@ def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series) -> pd.DataFrame:
     hy_bps = hy_bps.sort_index()
     trailing_median = hy_bps.rolling(TRAILING_WINDOW_DAYS, min_periods=30).median()
 
-    confirmed_dates = alerts_df.index[alerts_df["confirmed"]].sort_values()
-    if len(confirmed_dates) == 0:
+    trigger_dates = alerts_df.index[alerts_df["num_breached"] >= min_breach].sort_values()
+    if len(trigger_dates) == 0:
         return pd.DataFrame(columns=["start", "peak_date", "peak_bps", "calm_date", "trailing_median_at_start"])
 
     # group into raw clusters, bridging gaps <= MAX_GAP_DAYS trading days
@@ -137,8 +143,8 @@ def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series) -> pd.DataFrame:
     idx_of = {d: i for i, d in enumerate(date_list)}
 
     clusters = []
-    current = [confirmed_dates[0]]
-    for d in confirmed_dates[1:]:
+    current = [trigger_dates[0]]
+    for d in trigger_dates[1:]:
         gap = idx_of[d] - idx_of[current[-1]]
         if gap <= MAX_GAP_DAYS:
             current.append(d)
@@ -177,6 +183,31 @@ def build_clusters(alerts_df: pd.DataFrame, hy_bps: pd.Series) -> pd.DataFrame:
         })
 
     return pd.DataFrame(episodes)
+
+
+def compare_trigger_lead_time(confirmed_eps: pd.DataFrame, early_eps: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each confirmed (2-of-3) episode, finds the early (1-of-3) episode
+    whose span contains the confirmed episode's start date, and computes
+    how many trading days earlier the early trigger fired. This is the
+    actual lead-time gain from loosening the trigger, not a guess.
+    """
+    rows = []
+    for _, conf in confirmed_eps.iterrows():
+        match = early_eps[
+            (early_eps["start"] <= conf["start"]) &
+            (early_eps["calm_date"] >= conf["start"])
+        ]
+        if len(match) == 0:
+            continue
+        early_start = match.iloc[0]["start"]
+        lead_days = (conf["start"] - early_start).days
+        rows.append({
+            "confirmed_start": conf["start"],
+            "early_start": early_start,
+            "calendar_days_earlier": lead_days,
+        })
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------
@@ -297,8 +328,15 @@ def main():
     alerts_df = compute_confirmed_alerts(hy_combined)
 
     print("Grouping into episodes (clustering, magnitude floor, calm-down extension)...")
-    clusters_df = build_clusters(alerts_df, hy_combined)
+    clusters_df = build_clusters(alerts_df, hy_combined, min_breach=CONFIRMATION_REQUIRED)
     clusters_df.to_csv("historical_spread_episodes.csv", index=False)
+
+    print("Building early-trigger episodes (1-of-3 windows, for lead-time comparison)...")
+    early_clusters_df = build_clusters(alerts_df, hy_combined, min_breach=1)
+    early_clusters_df.to_csv("historical_spread_episodes_early.csv", index=False)
+
+    lead_time_df = compare_trigger_lead_time(clusters_df, early_clusters_df)
+    lead_time_df.to_csv("early_trigger_lead_time.csv", index=False)
 
     print("Merging with S&P 500...")
     merged = alerts_df.join(sp500.rename("sp500_close"), how="outer")
@@ -338,13 +376,32 @@ def main():
 
     event_df = event_study(clusters_df, sp500)
     event_df.to_csv("event_study.csv", index=False)
-    print(f"\nEvent study (saved to event_study.csv):")
+    print(f"\nEvent study (confirmed, 2-of-3 trigger — saved to event_study.csv):")
     for _, row in event_df.iterrows():
         sig_flag = "***" if row["significant_at_5pct"] else "(not significant)"
         print(f"  {int(row['horizon_days'])}d after episode start: "
               f"mean return {row['mean_return_after_episode']}% vs baseline "
               f"{row['baseline_mean_return_pct']}% (diff {row['difference_pct']}pp, "
               f"p={row['p_value']}) {sig_flag}")
+
+    event_df_early = event_study(early_clusters_df, sp500)
+    event_df_early.to_csv("event_study_early.csv", index=False)
+    print(f"\nEvent study (EARLY, 1-of-3 trigger — {len(early_clusters_df)} episodes vs "
+          f"{len(clusters_df)} confirmed — saved to event_study_early.csv):")
+    for _, row in event_df_early.iterrows():
+        sig_flag = "***" if row["significant_at_5pct"] else "(not significant)"
+        print(f"  {int(row['horizon_days'])}d after episode start: "
+              f"mean return {row['mean_return_after_episode']}% vs baseline "
+              f"{row['baseline_mean_return_pct']}% (diff {row['difference_pct']}pp, "
+              f"p={row['p_value']}) {sig_flag}")
+
+    if not lead_time_df.empty:
+        avg_lead = lead_time_df["calendar_days_earlier"].mean()
+        print(f"\nLead time gained by using the earlier (1-of-3) trigger:")
+        print(f"  Matched {len(lead_time_df)} of {len(clusters_df)} confirmed episodes to an earlier trigger")
+        print(f"  Average lead time gained: {avg_lead:.1f} calendar days")
+        print(f"  Trade-off: {len(early_clusters_df)} early episodes vs {len(clusters_df)} confirmed "
+              f"({len(early_clusters_df) - len(clusters_df)} extra episodes, i.e. potential false positives)")
 
     # flag the data gap explicitly so it's visible in the console too
     gap_start = mirror.index.max()

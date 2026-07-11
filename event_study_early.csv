@@ -1,0 +1,5 @@
+horizon_days,n_episodes,mean_return_after_episode,baseline_mean_return_pct,difference_pct,t_stat,p_value,significant_at_5pct
+5,9,-0.58,0.27,-0.85,-0.68,0.5158,False
+10,9,0.13,0.53,-0.4,-0.174,0.8663,False
+20,9,-0.76,1.05,-1.81,-0.459,0.6581,False
+60,9,7.4,3.18,4.22,1.453,0.1843,False
