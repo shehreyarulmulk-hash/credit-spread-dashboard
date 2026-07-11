@@ -127,6 +127,7 @@ try:
         x=hist.index, y=hist["hy_oas_bps"],
         name="HY OAS (bps)", yaxis="y1",
         line=dict(color="orange", width=1.5),
+        connectgaps=False,
     ))
 
     fig.add_trace(go.Scatter(

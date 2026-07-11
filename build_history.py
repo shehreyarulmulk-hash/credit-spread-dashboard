@@ -117,6 +117,18 @@ def main():
     hy_combined = hy_combined.sort_index()
     hy_combined = hy_combined[hy_combined.index >= "2018-01-01"]
 
+    # If there's a real gap between the two sources, insert an explicit NaN
+    # row right after the mirror ends. Without this, Plotly draws a
+    # straight line connecting the last pre-gap point to the first
+    # post-gap point, which LOOKS like real data but isn't -- this makes
+    # the gap show up as an honest break in the chart instead.
+    gap_start = mirror.index.max()
+    gap_end = recent.index.min()
+    if gap_end > gap_start:
+        nan_marker_date = gap_start + pd.Timedelta(days=1)
+        hy_combined.loc[nan_marker_date] = np.nan
+        hy_combined = hy_combined.sort_index()
+
     print("Fetching S&P 500 (2018-present)...")
     sp500 = fetch_sp500(start="2018-01-01")
 
